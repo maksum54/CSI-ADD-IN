@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>CSI EXR Importer</Name>
+    <Assembly>CsiExrImporter\CsiExrImporter.dll</Assembly>
+    <AddInId>7E4B2C1A-3D5F-4A8B-9C21-5F6E7D8A9B01</AddInId>
+    <FullClassName>CsiExrImporter.App</FullClassName>
+    <VendorId>CSIX</VendorId>
+    <VendorDescription>ETABS EXR to Revit importer</VendorDescription>
+  </AddIn>
+</RevitAddIns>
