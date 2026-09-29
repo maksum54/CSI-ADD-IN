@@ -1,7 +1,6 @@
 using System;
 using System.Linq;
 using System.Text;
-using System.Xml.Linq;
 using Autodesk.Revit.Attributes;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
@@ -36,15 +35,14 @@ namespace CsiExrImporter
             try { model = ExrParser.Parse(path); }
             catch (Exception ex)
             {
-                TaskDialog.Show("CSI EXR", "File tidak bisa dibaca sebagai XML EXR:\n" + ex.Message +
-                    "\n\nJika EXR Anda berformat biner, export ulang dari ETABS / CSiXRevit.");
+                TaskDialog.Show("CSI EXR", "File EXR tidak bisa dibaca:\n" + ex.Message);
                 return Result.Failed;
             }
 
             var td = new TaskDialog("CSI EXR - Konfirmasi")
             {
                 MainInstruction = "Import data berikut ke Revit?",
-                MainContent = $"Satuan: {model.Units}\nStory: {model.Stories.Count}\nGrid: {model.Grids.Count}\n" +
+                MainContent = $"Sumber: {model.Source ?? "-"}\nStory: {model.Stories.Count}\nGrid: {model.Grids.Count}\n" +
                               $"Section: {model.Sections.Count}\nFrame: {model.Frames.Count} " +
                               $"(kolom {model.Frames.Count(f => f.Kind == MemberKind.Column)}, " +
                               $"balok {model.Frames.Count(f => f.Kind == MemberKind.Beam)}, " +
@@ -75,18 +73,21 @@ namespace CsiExrImporter
             if (path == null) return Result.Cancelled;
             try
             {
-                var doc = XDocument.Load(path);
-                var sb = new StringBuilder($"Root: <{doc.Root?.Name.LocalName}>\n\nJumlah tag:\n");
-                foreach (var g in doc.Descendants().GroupBy(e => e.Name.LocalName).OrderByDescending(g => g.Count()).Take(30))
+                var m = ExrParser.Parse(path);
+                var sb = new StringBuilder($"Sumber: {m.Source ?? "-"}\n\nStory ({m.Stories.Count}):\n");
+                foreach (var s in m.Stories) sb.AppendLine($"  {s.Name}  {s.Elevation * 0.3048:0.###} m");
+                sb.AppendLine($"\nGrid ({m.Grids.Count}): " + string.Join(", ", m.Grids.Select(g => g.Name)));
+                sb.AppendLine($"\nSection ({m.Sections.Count}):");
+                foreach (var s in m.Sections.Values)
                 {
-                    var sample = g.First();
-                    string attrs = string.Join(", ", sample.Attributes().Select(a => a.Name.LocalName).Take(8));
-                    sb.AppendLine($"  {g.Key} x{g.Count()}" + (attrs.Length > 0 ? $"  [{attrs}]" : ""));
+                    int n = m.Frames.Count(f => f.Section == s);
+                    string dims = string.Join(" ", s.Dims.Select(kv => $"{kv.Key}={kv.Value * 304.8:0}mm"));
+                    sb.AppendLine($"  {s.Name} x{n}  {s.Family ?? "(baja)"}  {dims}");
                 }
                 TaskDialog.Show("CSI EXR - Inspect", sb.ToString());
                 return Result.Succeeded;
             }
-            catch (Exception ex) { message = "Bukan XML: " + ex.Message; return Result.Failed; }
+            catch (Exception ex) { message = ex.Message; return Result.Failed; }
         }
     }
 }

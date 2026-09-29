@@ -1,137 +1,144 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
-using System.Xml.Linq;
+using System.IO;
+using System.Text;
 
 namespace CsiExrImporter
 {
     /// <summary>
-    /// Parser toleran untuk file .exr (XML, CSiXRevit/ETABS). Nama tag dan atribut dicocokkan
-    /// tanpa peduli huruf besar/kecil dan dengan beberapa alias, karena skema berbeda antar versi.
+    /// Pembaca file .exr biner dari ETABS (CSiXRevit). Format hasil reverse-engineering:
+    /// setiap objek diawali GUID (string UInt16-length + 36 char), lalu Int32 id dan string label.
+    ///   id == -1 : Story  -> double elevasi
+    ///   id ==  0 : Grid   -> 48 byte, lalu X1,Y1,Z1,X2,Y2,Z2
+    ///   id  >  0 : Frame  -> X1,X2,Y1,Y2,Z1,Z2, rotasi, ..., Int32 jenis (1 kolom, 2 balok, 3 bracing),
+    ///                         string section, string family, pasangan (double nilai, 6 byte, string nama param)
+    /// Semua panjang dalam feet.
     /// </summary>
     public static class ExrParser
     {
         public static ExrModel Parse(string path)
         {
-            var doc = XDocument.Load(path);
-            var all = doc.Descendants().ToList();
+            byte[] d = File.ReadAllBytes(path);
             var m = new ExrModel();
+            var starts = FindGuids(d);
 
-            var unitsEl = all.FirstOrDefault(e => Is(e, "Units", "LengthUnits", "UnitsLength"));
-            string u = unitsEl != null ? unitsEl.Value : Get(doc.Root, "Units", "LengthUnits");
-            if (!string.IsNullOrWhiteSpace(u)) m.Units = u.Trim();
-
-            foreach (var e in all.Where(e => Is(e, "Story", "Level", "Storey")))
+            for (int i = 0; i < starts.Count; i++)
             {
-                double? z = Num(e, "Elevation", "Elev", "Z", "Height");
-                if (z == null) continue;
-                m.Stories.Add(new ExrStory { Name = Get(e, "Name", "Label", "ID") ?? $"Story {m.Stories.Count + 1}", Elevation = z.Value });
-            }
+                int end = i + 1 < starts.Count ? starts[i + 1] : d.Length;
+                int p = starts[i] + 38;
+                if (p + 6 > end) continue;
+                int id = BitConverter.ToInt32(d, p);
+                if (!TryStr(d, p + 4, end, out string label, out int q)) continue;
 
-            foreach (var e in all.Where(e => Is(e, "Grid", "GridLine", "Gridline")))
-            {
-                var x1 = Num(e, "X1", "StartX"); var y1 = Num(e, "Y1", "StartY");
-                var x2 = Num(e, "X2", "EndX"); var y2 = Num(e, "Y2", "EndY");
-                if (x1 == null || y1 == null || x2 == null || y2 == null) continue;
-                m.Grids.Add(new ExrGrid { Name = Get(e, "Name", "Label", "ID"), X1 = x1.Value, Y1 = y1.Value, X2 = x2.Value, Y2 = y2.Value });
-            }
-
-            foreach (var e in all.Where(e => Is(e, "Section", "FrameSection", "FrameSect", "Property", "FrameProperty")))
-            {
-                string name = Get(e, "Name", "Label", "ID");
-                if (name == null) continue;
-                m.Sections[name] = new ExrSection
+                if (id == -1)
                 {
-                    Name = name,
-                    Material = Get(e, "Material", "Mat"),
-                    Shape = Get(e, "Shape", "Type", "SectionType"),
-                    Depth = Num(e, "Depth", "t3", "D", "H", "Height") ?? 0,
-                    Width = Num(e, "Width", "t2", "B", "W") ?? 0,
-                };
-            }
-
-            // Titik/joint (untuk frame yang referensi ke ID titik)
-            var points = new Dictionary<string, ExrPoint>(StringComparer.OrdinalIgnoreCase);
-            foreach (var e in all.Where(e => Is(e, "Point", "Joint", "Node")))
-            {
-                string id = Get(e, "ID", "Name", "Label");
-                var x = Num(e, "X"); var y = Num(e, "Y"); var z = Num(e, "Z");
-                if (id != null && x != null && y != null && z != null)
-                    points[id] = new ExrPoint { X = x.Value, Y = y.Value, Z = z.Value };
-            }
-
-            foreach (var e in all.Where(e => Is(e, "Frame", "Member", "Column", "Beam", "Brace", "FrameObject", "Line")))
-            {
-                ExrPoint s = Pt(e, "1", "I", "Start") ?? Ref(e, points, "Point1", "PointI", "JointI", "StartPoint", "Node1");
-                ExrPoint t = Pt(e, "2", "J", "End") ?? Ref(e, points, "Point2", "PointJ", "JointJ", "EndPoint", "Node2");
-                if (s == null || t == null) continue;
-
-                string type = (Get(e, "Type", "DesignType", "Kind", "ObjectType") ?? e.Name.LocalName).ToLowerInvariant();
-                MemberKind kind =
-                    type.Contains("col") ? MemberKind.Column :
-                    type.Contains("brac") ? MemberKind.Brace :
-                    type.Contains("beam") ? MemberKind.Beam : Classify(s, t);
-
-                m.Frames.Add(new ExrFrame
+                    if (q + 8 <= end) m.Stories.Add(new ExrStory { Name = label, Elevation = Dbl(d, q) });
+                }
+                else if (id == 0)
                 {
-                    Id = Get(e, "ID", "Name", "Label"),
-                    Section = Get(e, "Section", "SectionName", "Property", "Prop", "SectProp"),
-                    Kind = kind, Start = s, End = t,
-                });
+                    if (q + 48 + 48 > end) continue;
+                    double x1 = Dbl(d, q + 48), y1 = Dbl(d, q + 56), x2 = Dbl(d, q + 72), y2 = Dbl(d, q + 80);
+                    if (Sane(x1, y1, x2, y2) && Math.Abs(x2 - x1) + Math.Abs(y2 - y1) > 1e-6)
+                        m.Grids.Add(new ExrGrid { Name = label, X1 = x1, Y1 = y1, X2 = x2, Y2 = y2 });
+                }
+                else
+                {
+                    if (q + 70 > end) continue;
+                    int kind = BitConverter.ToInt32(d, q + 66);
+                    if (kind < 1 || kind > 3) continue;   // material, load pattern, dll.
+                    double x1 = Dbl(d, q), x2 = Dbl(d, q + 8), y1 = Dbl(d, q + 16), y2 = Dbl(d, q + 24),
+                           z1 = Dbl(d, q + 32), z2 = Dbl(d, q + 40);
+                    if (!Sane(x1, x2, y1, y2, z1, z2)) continue;
+
+                    m.Frames.Add(new ExrFrame
+                    {
+                        Id = id, Label = label, Kind = (MemberKind)kind,
+                        Start = new ExrPoint { X = x1, Y = y1, Z = z1 },
+                        End = new ExrPoint { X = x2, Y = y2, Z = z2 },
+                        Rotation = Dbl(d, q + 48),
+                        Section = ReadSection(d, q + 70, end, m),
+                    });
+                }
             }
 
+            int etabs = IndexOf(d, Encoding.ASCII.GetBytes("ETABS"), 0);
+            if (etabs > 0 && etabs + 9 < d.Length)
+            {
+                int n = BitConverter.ToInt32(d, etabs + 5);   // di footer panjang string memakai Int32
+                if (n > 0 && n < 32 && etabs + 9 + n <= d.Length) m.Source = "ETABS " + Encoding.ASCII.GetString(d, etabs + 9, n);
+            }
             return m;
         }
 
-        static MemberKind Classify(ExrPoint a, ExrPoint b)
+        static ExrSection ReadSection(byte[] d, int pos, int end, ExrModel m)
         {
-            double dz = Math.Abs(b.Z - a.Z);
-            double dxy = Math.Sqrt(Math.Pow(b.X - a.X, 2) + Math.Pow(b.Y - a.Y, 2));
-            if (dxy < 1e-6) return MemberKind.Column;
-            if (dz < 1e-6) return MemberKind.Beam;
-            return MemberKind.Brace;
-        }
-
-        static ExrPoint Pt(XElement e, params string[] suffixes)
-        {
-            foreach (var s in suffixes)
+            var names = new List<string>();
+            while (pos < end - 2 && names.Count < 2)
             {
-                var x = Num(e, "X" + s, s + "X"); var y = Num(e, "Y" + s, s + "Y"); var z = Num(e, "Z" + s, s + "Z");
-                if (x != null && y != null && z != null) return new ExrPoint { X = x.Value, Y = y.Value, Z = z.Value };
+                if (TryStr(d, pos, end, out string s, out int next) && s.Length >= 2 && char.IsLetterOrDigit(s[0]))
+                { names.Add(s); pos = next; }
+                else pos++;
             }
-            return null;
-        }
+            if (names.Count == 0) return null;
+            string secName = names[0];
+            if (m.Sections.TryGetValue(secName, out var sec)) return sec;
 
-        static ExrPoint Ref(XElement e, Dictionary<string, ExrPoint> pts, params string[] names)
-        {
-            string id = Get(e, names);
-            return id != null && pts.TryGetValue(id, out var p) ? p : null;
-        }
+            sec = new ExrSection { Name = secName, Family = names.Count > 1 ? names[1] : null };
+            // Kalau string kedua ternyata bukan family (baja tidak punya family), abaikan.
+            if (sec.Family != null && sec.Family.Length < 3) sec.Family = null;
 
-        static bool Is(XElement e, params string[] names) =>
-            names.Any(n => string.Equals(e.Name.LocalName, n, StringComparison.OrdinalIgnoreCase));
-
-        /// <summary>Nilai dari atribut atau child element langsung.</summary>
-        internal static string Get(XElement e, params string[] names)
-        {
-            if (e == null) return null;
-            foreach (var n in names)
+            // Parameter dimensi: double(8) + 6 byte nol + string panjang 1 (huruf besar)
+            for (int j = pos + 14; j < end - 3; j++)
             {
-                var a = e.Attributes().FirstOrDefault(x => string.Equals(x.Name.LocalName, n, StringComparison.OrdinalIgnoreCase));
-                if (a != null && !string.IsNullOrWhiteSpace(a.Value)) return a.Value.Trim();
-                var c = e.Elements().FirstOrDefault(x => string.Equals(x.Name.LocalName, n, StringComparison.OrdinalIgnoreCase) && !x.HasElements);
-                if (c != null && !string.IsNullOrWhiteSpace(c.Value)) return c.Value.Trim();
+                if (d[j] == 1 && d[j + 1] == 0 && d[j + 2] >= 'A' && d[j + 2] <= 'Z' && Zeros(d, j - 6, 6))
+                {
+                    double v = Dbl(d, j - 14);
+                    if (v > 0 && v < 50) sec.Dims[((char)d[j + 2]).ToString()] = v;
+                }
             }
-            return null;
+            m.Sections[secName] = sec;
+            return sec;
         }
 
-        static double? Num(XElement e, params string[] names)
+        static List<int> FindGuids(byte[] d)
         {
-            string s = Get(e, names);
-            if (s == null) return null;
-            s = s.Replace(',', '.');
-            return double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : null;
+            var res = new List<int>();
+            for (int i = 0; i + 38 <= d.Length; i++)
+            {
+                if (d[i] != 0x24 || d[i + 1] != 0) continue;
+                if (d[i + 10] == '-' && d[i + 15] == '-' && d[i + 20] == '-' && d[i + 25] == '-' && Hex(d, i + 2, 8))
+                { res.Add(i); i += 37; }
+            }
+            return res;
+        }
+
+        static bool TryStr(byte[] d, int p, int end, out string s, out int next)
+        {
+            s = null; next = p;
+            if (p + 2 > end) return false;
+            int n = BitConverter.ToUInt16(d, p);
+            if (n < 1 || n > 256 || p + 2 + n > end) return false;
+            for (int k = 0; k < n; k++) if (d[p + 2 + k] < 32 || d[p + 2 + k] > 126) return false;
+            s = Encoding.ASCII.GetString(d, p + 2, n); next = p + 2 + n;
+            return true;
+        }
+
+        static double Dbl(byte[] d, int p) => BitConverter.ToDouble(d, p);
+        static bool Sane(params double[] v) { foreach (var x in v) if (double.IsNaN(x) || Math.Abs(x) > 1e6) return false; return true; }
+        static bool Zeros(byte[] d, int p, int n) { for (int k = 0; k < n; k++) if (d[p + k] != 0) return false; return true; }
+        static bool Hex(byte[] d, int p, int n)
+        {
+            for (int k = 0; k < n; k++) { byte c = d[p + k]; if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false; }
+            return true;
+        }
+        static int IndexOf(byte[] d, byte[] pat, int from)
+        {
+            for (int i = from; i <= d.Length - pat.Length; i++)
+            {
+                int k = 0; while (k < pat.Length && d[i + k] == pat[k]) k++;
+                if (k == pat.Length) return i;
+            }
+            return -1;
         }
     }
 }

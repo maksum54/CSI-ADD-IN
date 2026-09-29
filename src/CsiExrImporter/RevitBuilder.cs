@@ -11,38 +11,17 @@ namespace CsiExrImporter
     {
         readonly Document _doc;
         readonly ExrModel _m;
-        readonly ForgeTypeId _unit;
         readonly StringBuilder _log = new();
+        readonly HashSet<string> _logged = new();
         readonly List<Level> _levels = new();
         readonly Dictionary<string, FamilySymbol> _symbolCache = new(StringComparer.OrdinalIgnoreCase);
 
         public int Levels, Grids, Columns, Beams, Braces, Skipped;
         public string Log => _log.ToString();
 
-        public RevitBuilder(Document doc, ExrModel m)
-        {
-            _doc = doc; _m = m;
-            _unit = UnitFromString(m.Units);
-        }
+        public RevitBuilder(Document doc, ExrModel m) { _doc = doc; _m = m; }
 
-        static ForgeTypeId UnitFromString(string u)
-        {
-            switch ((u ?? "").ToLowerInvariant())
-            {
-                case "mm": case "millimeter": case "millimeters": return UnitTypeId.Millimeters;
-                case "cm": case "centimeter": case "centimeters": return UnitTypeId.Centimeters;
-                case "ft": case "feet": case "foot": return UnitTypeId.Feet;
-                case "in": case "inch": case "inches": return UnitTypeId.Inches;
-                default:
-                    if (u != null && u.ToLowerInvariant().Contains("mm")) return UnitTypeId.Millimeters;
-                    if (u != null && u.ToLowerInvariant().Contains("ft")) return UnitTypeId.Feet;
-                    if (u != null && u.ToLowerInvariant().Contains("in")) return UnitTypeId.Inches;
-                    return UnitTypeId.Meters;
-            }
-        }
-
-        double L(double v) => UnitUtils.ConvertToInternalUnits(v, _unit);
-        XYZ P(ExrPoint p) => new XYZ(L(p.X), L(p.Y), L(p.Z));
+        static XYZ P(ExrPoint p) => new(p.X, p.Y, p.Z);   // EXR sudah dalam feet
 
         public void Build()
         {
@@ -64,10 +43,8 @@ namespace CsiExrImporter
             _levels.AddRange(new FilteredElementCollector(_doc).OfClass(typeof(Level)).Cast<Level>());
             foreach (var s in _m.Stories.OrderBy(s => s.Elevation))
             {
-                double z = L(s.Elevation);
-                var existing = _levels.FirstOrDefault(l => Math.Abs(l.Elevation - z) < 1e-4);
-                if (existing != null) continue;
-                var lvl = Level.Create(_doc, z);
+                if (_levels.Any(l => Math.Abs(l.Elevation - s.Elevation) < 1e-4)) continue;
+                var lvl = Level.Create(_doc, s.Elevation);
                 TrySetName(lvl, s.Name);
                 _levels.Add(lvl);
                 Levels++;
@@ -82,7 +59,7 @@ namespace CsiExrImporter
             foreach (var g in _m.Grids)
             {
                 if (g.Name != null && existing.Contains(g.Name)) continue;
-                var a = new XYZ(L(g.X1), L(g.Y1), 0); var b = new XYZ(L(g.X2), L(g.Y2), 0);
+                var a = new XYZ(g.X1, g.Y1, 0); var b = new XYZ(g.X2, g.Y2, 0);
                 if (a.DistanceTo(b) < _doc.Application.ShortCurveTolerance) continue;
                 var grid = Grid.Create(_doc, Line.CreateBound(a, b));
                 TrySetName(grid, g.Name);
@@ -102,9 +79,9 @@ namespace CsiExrImporter
 
                     var cat = f.Kind == MemberKind.Column ? BuiltInCategory.OST_StructuralColumns : BuiltInCategory.OST_StructuralFraming;
                     var sym = GetSymbol(cat, f.Section);
-                    if (sym == null) { Skipped++; _log.AppendLine($"[{f.Id}] tidak ada family {cat} di project, dilewati."); continue; }
+                    if (sym == null) { Skipped++; Note($"nofam|{cat}", $"Tidak ada family {Cat(cat)} di project, elemen dilewati."); continue; }
 
-                    Level lvl = f.Kind == MemberKind.Column ? LevelBelow(a.Z) : LevelBelow(Math.Min(a.Z, b.Z) + 1e-3);
+                    Level lvl = LevelBelow(Math.Min(a.Z, b.Z) + 1e-3);
                     var st = f.Kind switch
                     {
                         MemberKind.Column => StructuralType.Column,
@@ -112,7 +89,7 @@ namespace CsiExrImporter
                         _ => StructuralType.Beam,
                     };
                     var inst = _doc.Create.NewFamilyInstance(Line.CreateBound(a, b), sym, lvl, st);
-                    inst.LookupParameter("Comments")?.Set($"ETABS {f.Id}");
+                    inst.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)?.Set($"ETABS {f.Label}");
 
                     if (f.Kind == MemberKind.Column) Columns++;
                     else if (f.Kind == MemberKind.Brace) Braces++;
@@ -121,7 +98,7 @@ namespace CsiExrImporter
                 catch (Exception ex)
                 {
                     Skipped++;
-                    _log.AppendLine($"[{f.Id}] gagal: {ex.Message}");
+                    Note("err|" + ex.Message, $"[{f.Label}] gagal: {ex.Message}");
                 }
             }
         }
@@ -130,44 +107,68 @@ namespace CsiExrImporter
             _levels.Where(l => l.Elevation <= z + 1e-4).OrderByDescending(l => l.Elevation).FirstOrDefault()
             ?? _levels.OrderBy(l => l.Elevation).First();
 
-        /// <summary>Cari type dengan nama section ETABS; jika tidak ada, duplikat type pertama dan set dimensi b/h.</summary>
-        FamilySymbol GetSymbol(BuiltInCategory cat, string section)
+        /// <summary>
+        /// Urutan pencarian type: (1) family EXR + nama section, (2) nama section di family manapun,
+        /// (3) duplikat type dari family EXR (beton) lalu isi b/h, (4) type pertama di kategori.
+        /// </summary>
+        FamilySymbol GetSymbol(BuiltInCategory cat, ExrSection sec)
         {
-            string key = cat + "|" + (section ?? "");
+            string key = cat + "|" + sec?.Name;
             if (_symbolCache.TryGetValue(key, out var cached)) return cached;
 
             var symbols = new FilteredElementCollector(_doc).OfClass(typeof(FamilySymbol)).OfCategory(cat)
                 .Cast<FamilySymbol>().ToList();
             if (symbols.Count == 0) return null;
 
-            FamilySymbol sym = section == null ? null
-                : symbols.FirstOrDefault(s => string.Equals(s.Name, section, StringComparison.OrdinalIgnoreCase));
+            FamilySymbol sym = null;
+            if (sec != null)
+            {
+                var famSyms = sec.Family == null ? new List<FamilySymbol>()
+                    : symbols.Where(s => Same(s.FamilyName, sec.Family)).ToList();
+                sym = famSyms.FirstOrDefault(s => Same(s.Name, sec.Name))
+                      ?? symbols.FirstOrDefault(s => Same(s.Name, sec.Name));
 
+                if (sym == null && famSyms.Count > 0)
+                {
+                    sym = (FamilySymbol)famSyms[0].Duplicate(sec.Name);
+                    SetDims(sym, sec);
+                    Note("dup|" + sec.Name, $"Type baru '{sec.Family}: {sec.Name}' dibuat.");
+                }
+            }
             if (sym == null)
             {
-                _m.Sections.TryGetValue(section ?? "", out var sec);
-                bool circle = sec?.Shape?.ToLowerInvariant().Contains("circ") == true;
-                var template = symbols.FirstOrDefault(s => (s.LookupParameter("b") != null && s.LookupParameter("h") != null) && !circle)
-                               ?? symbols.FirstOrDefault(s => circle && s.LookupParameter("d") != null)
-                               ?? symbols.First();
-                if (section != null)
-                {
-                    sym = (FamilySymbol)template.Duplicate(section);
-                    if (sec != null)
-                    {
-                        if (sec.Width > 0) sym.LookupParameter("b")?.Set(L(sec.Width));
-                        if (sec.Depth > 0) sym.LookupParameter("h")?.Set(L(sec.Depth));
-                        if (circle && sec.Depth > 0) sym.LookupParameter("d")?.Set(L(sec.Depth));
-                    }
-                    _log.AppendLine($"Type baru '{section}' dibuat dari '{template.FamilyName}: {template.Name}'.");
-                }
-                else sym = template;
+                sym = symbols[0];
+                Note("fb|" + sec?.Name, $"Section '{sec?.Name}'" + (sec?.Family != null ? $" (family {sec.Family})" : "") +
+                     $" tidak ditemukan, pakai '{sym.FamilyName}: {sym.Name}'. Load family/type yang sesuai lalu import ulang.");
             }
 
             if (!sym.IsActive) sym.Activate();
             _symbolCache[key] = sym;
             return sym;
         }
+
+        static void SetDims(FamilySymbol sym, ExrSection sec)
+        {
+            sec.Dims.TryGetValue("B", out double bw);
+            sec.Dims.TryGetValue("H", out double h);
+            if (h <= 0) h = bw;          // kolom persegi hanya punya B
+            if (bw <= 0) bw = h;
+            if (bw > 0) Set(sym, bw, "b", "B", "Width");
+            if (h > 0) Set(sym, h, "h", "H", "Depth");
+        }
+
+        static void Set(FamilySymbol sym, double v, params string[] names)
+        {
+            foreach (var n in names)
+            {
+                var p = sym.LookupParameter(n);
+                if (p != null && !p.IsReadOnly && p.StorageType == StorageType.Double) { p.Set(v); return; }
+            }
+        }
+
+        void Note(string key, string msg) { if (_logged.Add(key)) _log.AppendLine(msg); }
+        static bool Same(string a, string b) => string.Equals(a?.Trim(), b?.Trim(), StringComparison.OrdinalIgnoreCase);
+        static string Cat(BuiltInCategory c) => c == BuiltInCategory.OST_StructuralColumns ? "Structural Column" : "Structural Framing";
 
         static void TrySetName(Element e, string name)
         {
