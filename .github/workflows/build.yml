@@ -1,0 +1,28 @@
+name: Build add-in
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build
+        run: dotnet build src/CsiExrImporter -c Release
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "src/CsiExrImporter/bin/Release/net8.0-windows"
+          New-Item -ItemType Directory -Force pkg/CsiExrImporter | Out-Null
+          Copy-Item "$out/*" pkg/CsiExrImporter -Recurse
+          Remove-Item pkg/CsiExrImporter/CsiExrImporter.addin -ErrorAction SilentlyContinue
+          Copy-Item src/CsiExrImporter/CsiExrImporter.addin pkg/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CsiExrImporter-Revit2025
+          path: pkg/
